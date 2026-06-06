@@ -24,7 +24,7 @@ library(stringr)
 library(grid)
 
 # ============================================================
-# forward thinking stuff! 
+# forward thinking stuff! Excluding subjects an all...
 # change the file path to yours 
 # ============================================================
 
