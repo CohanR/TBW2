@@ -1,0 +1,1785 @@
+# ============================================================
+# TBW and RT analysis from participantdata.xlsx
+# gaussian and sigmoid (AV/VA) analysis
+# with individual QC plots
+# Remy Cohan, October 11, 2023
+# CohanR.GitHub.io
+# Updated: December 05, 2023; RC
+# Updated July 23, 2025; RC
+# ============================================================
+
+# ============================================================
+# packages (download/install/load)
+# ============================================================
+
+library(tidyverse)
+library(readxl)
+library(minpack.lm)
+library(effectsize)
+library(ggplot2)
+library(knitr)
+library(broom)
+library(stringr)
+library(grid)
+
+# ============================================================
+# forward thinking stuff! 
+# change the file path to yours 
+# ============================================================
+
+file_path <- "/Volumes/RC_2T/RemyCohan/participantdata.xlsx"
+sheet_name <- 1
+
+# run one or both (depending on the condition you want to analyse):
+# "ip_vs_ol"         = binocular in person vs binocular online
+# "bi_vs_mo_online" = binocular online vs monocular online
+analysis_modes <- c("ip_vs_ol", "bi_vs_mo_online")
+
+# optional manual exclusion...be nice! 
+# leave empty if you want everyone included, dah!
+exclude_sub_ids <- character(0)
+# e.g.,:
+# exclude_sub_ids <- c("sub-003", "sub-021")
+
+exclude_participant_ids <- character(0)
+# e.g.,:
+# exclude_participant_ids <- c("AA2005", "NM2004")
+
+# fitting bounds.
+# large bounds allow the raw fitted 50% crossing to exist,
+# but the fit is flagged if x0 is outside the tested SOA range.
+x0_abs_bound <- 10000
+k_abs_bound  <- 10000
+
+save_plots <- TRUE
+save_csv_outputs <- TRUE
+show_all_subject_plots_in_rstudio <- FALSE
+
+out_root <- "/Users/remycohan/Downloads/TBW_outputs_clean"
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+group_colours <- c(
+  "IP" = "blue",
+  "OL" = "red",
+  "BI" = "red",
+  "MO" = "blue"
+)
+
+# ============================================================
+# dady's little helpers (ok calm dawn...helper fx )
+# ============================================================
+
+nice_tbl <- function(x, caption = NULL, digits = 3, align = "r") {
+  if (inherits(x, "htest")) x <- broom::tidy(x)
+  if (inherits(x, "effectsize_table") || inherits(x, "effectsize")) x <- as.data.frame(x)
+  knitr::kable(x, caption = caption, digits = digits, align = align)
+}
+
+clean_chr <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_squish(x)
+  x[x == ""] <- NA_character_
+  x
+}
+
+to_num <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+standardise_condition <- function(x) {
+  x_low <- stringr::str_to_lower(as.character(x))
+  
+  dplyr::case_when(
+    stringr::str_detect(x_low, "inperson|in person|in-person") ~ "IP",
+    stringr::str_detect(x_low, "online|on-line|on line")       ~ "OL",
+    TRUE ~ NA_character_
+  )
+}
+
+standardise_viewing <- function(x) {
+  x_low <- stringr::str_to_lower(as.character(x))
+  
+  dplyr::case_when(
+    stringr::str_detect(x_low, "monocular") ~ "Monocular",
+    stringr::str_detect(x_low, "binocular") ~ "Binocular",
+    TRUE ~ NA_character_
+  )
+}
+
+extract_soa <- function(x) {
+  as.numeric(stringr::str_extract(as.character(x), "-?\\d+"))
+}
+
+make_grid <- function(x, n = 600) {
+  x <- x[is.finite(x)]
+  if (length(unique(x)) < 2) return(numeric(0))
+  seq(min(x), max(x), length.out = n)
+}
+
+valid_x0_range <- function(x0, soa_values) {
+  soa_values <- soa_values[is.finite(soa_values)]
+  if (!is.finite(x0)) return(FALSE)
+  if (length(soa_values) < 2) return(FALSE)
+  
+  x0 >= min(soa_values, na.rm = TRUE) &&
+    x0 <= max(soa_values, na.rm = TRUE)
+}
+
+# ============================================================
+# sigmoid fitting and all that jazz
+# ============================================================
+# main TBW method:
+# AV side: negative SOAs only
+# VA side: positive SOAs only
+#
+# model:
+# y = 1 / (1 + exp(-(SOA - x0) / k))
+#
+# TBW AV = abs(AV x0)
+# TBW VA = abs(VA x0)
+# Full TBW = TBW AV + TBW VA
+
+# no capping!
+# no automatic exclusion!!
+# fits are flagged but retained!!! 
+# full on EDI!!!!
+# ============================================================
+
+fit_sigmoid_side <- function(df_side, side_label) {
+  
+  df_nl <- df_side %>%
+    dplyr::filter(is.finite(SOA), is.finite(prop)) %>%
+    dplyr::arrange(SOA)
+  
+  base_pts <- tibble::tibble(SOA = sort(unique(df_side$SOA)))
+  grid <- make_grid(df_side$SOA)
+  
+  fail <- list(
+    x0 = NA_real_,
+    k = NA_real_,
+    rss = NA_real_,
+    x0_side_ok = FALSE,
+    k_direction_ok = FALSE,
+    x0_in_range = FALSE,
+    fit_flag = "fit_failed",
+    tbw_raw = NA_real_,
+    pred_pts = base_pts %>% dplyr::mutate(sig_fit = NA_real_),
+    pred_grid = tibble::tibble(SOA = grid, sig_fit = NA_real_)
+  )
+  
+  if (
+    nrow(df_nl) < 3 ||
+    length(unique(df_nl$SOA)) < 3 ||
+    sd(df_nl$prop, na.rm = TRUE) < 1e-8
+  ) {
+    return(fail)
+  }
+  
+  start_x0 <- median(df_nl$SOA, na.rm = TRUE)
+  
+  expected_k_start <- ifelse(side_label == "AV", 50, -50)
+  opposite_k_start <- -expected_k_start
+  
+  try_fit <- function(k_start) {
+    try(
+      minpack.lm::nlsLM(
+        prop ~ 1 / (1 + exp(-(SOA - x0) / k)),
+        data = df_nl,
+        start = list(x0 = start_x0, k = k_start),
+        lower = c(x0 = -x0_abs_bound, k = -k_abs_bound),
+        upper = c(x0 =  x0_abs_bound, k =  k_abs_bound),
+        control = minpack.lm::nls.lm.control(
+          maxiter = 1000,
+          ftol = 1e-12,
+          ptol = 1e-12
+        )
+      ),
+      silent = TRUE
+    )
+  }
+  
+  fits <- list(
+    expected = try_fit(expected_k_start),
+    opposite = try_fit(opposite_k_start)
+  )
+  
+  get_rss <- function(f) {
+    if (inherits(f, "try-error")) return(Inf)
+    sum(residuals(f)^2, na.rm = TRUE)
+  }
+  
+  rss_vals <- purrr::map_dbl(fits, get_rss)
+  
+  if (!any(is.finite(rss_vals))) {
+    return(fail)
+  }
+  
+  fit <- fits[[which.min(rss_vals)]]
+  rss_final <- min(rss_vals, na.rm = TRUE)
+  
+  co <- coef(fit)
+  x0 <- unname(co[["x0"]])
+  k  <- unname(co[["k"]])
+  
+  x0_side_ok <- dplyr::case_when(
+    side_label == "AV" ~ is.finite(x0) && x0 < 0,
+    side_label == "VA" ~ is.finite(x0) && x0 > 0,
+    TRUE ~ FALSE
+  )
+  
+  k_direction_ok <- dplyr::case_when(
+    side_label == "AV" ~ is.finite(k) && k > 0,
+    side_label == "VA" ~ is.finite(k) && k < 0,
+    TRUE ~ FALSE
+  )
+  
+  x0_in_range <- valid_x0_range(x0, df_nl$SOA)
+  
+  fit_flag <- dplyr::case_when(
+    !isTRUE(x0_side_ok) ~ "wrong_side_x0",
+    !isTRUE(k_direction_ok) ~ "wrong_curve_direction",
+    !isTRUE(x0_in_range) ~ "x0_outside_tested_range",
+    TRUE ~ "ok"
+  )
+  
+  pred_pts <- base_pts %>%
+    dplyr::mutate(sig_fit = 1 / (1 + exp(-(SOA - x0) / k)))
+  
+  pred_grid <- tibble::tibble(SOA = grid) %>%
+    dplyr::mutate(sig_fit = 1 / (1 + exp(-(SOA - x0) / k)))
+  
+  list(
+    x0 = x0,
+    k = k,
+    rss = rss_final,
+    x0_side_ok = x0_side_ok,
+    k_direction_ok = k_direction_ok,
+    x0_in_range = x0_in_range,
+    fit_flag = fit_flag,
+    tbw_raw = abs(x0),
+    pred_pts = pred_pts,
+    pred_grid = pred_grid
+  )
+}
+
+# ============================================================
+# gaussian fitting
+# ============================================================
+# this is for QC / visual overlay and because I like gaussian 
+#     better than two sigmoids! end of story! 
+# ============================================================
+
+fit_gaussian_full <- function(df_all) {
+  
+  df_nl <- df_all %>%
+    dplyr::filter(is.finite(SOA), is.finite(prop)) %>%
+    dplyr::arrange(SOA)
+  
+  base_pts <- tibble::tibble(SOA = sort(unique(df_all$SOA)))
+  grid <- make_grid(df_all$SOA)
+  
+  fail <- list(
+    fwhm = NA_real_,
+    a = NA_real_,
+    b = NA_real_,
+    c = NA_real_,
+    rss = NA_real_,
+    fit_flag = "gaussian_fit_failed",
+    pred_pts = base_pts %>% dplyr::mutate(gauss_fit = NA_real_),
+    pred_grid = tibble::tibble(SOA = grid, gauss_fit = NA_real_)
+  )
+  
+  if (
+    nrow(df_nl) < 5 ||
+    length(unique(df_nl$SOA)) < 5 ||
+    sd(df_nl$prop, na.rm = TRUE) < 1e-8
+  ) {
+    return(fail)
+  }
+  
+  start_a <- min(1, max(df_nl$prop, na.rm = TRUE))
+  start_b <- 0
+  start_c <- max(20, diff(range(df_nl$SOA, na.rm = TRUE)) / 5)
+  
+  fit <- try(
+    minpack.lm::nlsLM(
+      prop ~ a * exp(-((SOA - b)^2) / (2 * c^2)),
+      data = df_nl,
+      start = list(a = start_a, b = start_b, c = start_c),
+      lower = c(a = 0, b = -x0_abs_bound, c = 1e-6),
+      upper = c(a = 1.05, b = x0_abs_bound, c = x0_abs_bound),
+      control = minpack.lm::nls.lm.control(
+        maxiter = 1000,
+        ftol = 1e-12,
+        ptol = 1e-12
+      )
+    ),
+    silent = TRUE
+  )
+  
+  if (inherits(fit, "try-error")) {
+    return(fail)
+  }
+  
+  co <- coef(fit)
+  
+  a <- unname(co[["a"]])
+  b <- unname(co[["b"]])
+  c <- abs(unname(co[["c"]]))
+  
+  fwhm <- 2.355 * c
+  
+  pred_pts <- base_pts %>%
+    dplyr::mutate(gauss_fit = a * exp(-((SOA - b)^2) / (2 * c^2)))
+  
+  pred_grid <- tibble::tibble(SOA = grid) %>%
+    dplyr::mutate(gauss_fit = a * exp(-((SOA - b)^2) / (2 * c^2)))
+  
+  rss <- sum(residuals(fit)^2, na.rm = TRUE)
+  
+  list(
+    fwhm = fwhm,
+    a = a,
+    b = b,
+    c = c,
+    rss = rss,
+    fit_flag = "ok",
+    pred_pts = pred_pts,
+    pred_grid = pred_grid
+  )
+}
+
+# ============================================================
+# read raw excel...if you're a student and reading this:
+# NO empty column headers
+# NO empty columns or rows
+# NO tabs
+# NO spaces (use underscores if you have the urge to pick weird two part 
+#           variable names); This also applies to file names 
+# NO colours or other niceties; we're conducting serious business; your  
+#             high school teacher lied to you
+# tabarnak de calisse ca va faire j’suis tanne en crisse
+# ============================================================
+
+raw <- readxl::read_excel(
+  file_path,
+  sheet = sheet_name,
+  col_names = FALSE,
+  .name_repair = "unique"
+)
+
+names(raw) <- paste0("col_", seq_along(names(raw)))
+
+raw <- raw %>%
+  dplyr::mutate(dplyr::across(dplyr::everything(), clean_chr))
+
+cat("\nRaw Excel loaded.\n")
+cat("Rows:", nrow(raw), "\n")
+cat("Columns:", ncol(raw), "\n")
+
+# ============================================================
+# parse excel block!!!!!!!!! If you listened to the above 
+#       I didn't have to do this!!!!!!!!!!!! 
+# ============================================================
+
+raw_mat <- as.data.frame(raw, stringsAsFactors = FALSE, check.names = FALSE)
+
+is_header_row <- apply(raw_mat, 1, function(r) {
+  r <- clean_chr(r)
+  
+  any(stringr::str_to_lower(r) == "sub_id", na.rm = TRUE) &&
+    any(stringr::str_detect(stringr::str_to_lower(r), "ill\\d+"), na.rm = TRUE)
+})
+
+header_rows <- which(is_header_row)
+
+if (length(header_rows) == 0) {
+  stop("No header rows found. Could not find rows containing sub_id and ill-number SOA columns.")
+}
+
+cat("\nHeader rows found:", paste(header_rows, collapse = ", "), "\n")
+
+all_long <- list()
+block_info <- list()
+
+for (h in seq_along(header_rows)) {
+  
+  header_i <- header_rows[h]
+  next_header <- ifelse(h < length(header_rows), header_rows[h + 1], nrow(raw_mat) + 1)
+  
+  header <- clean_chr(unlist(raw_mat[header_i, ]))
+  header_low <- stringr::str_to_lower(header)
+  header_text <- paste(header, collapse = " ")
+  
+  viewing_from_header <- standardise_viewing(header_text)
+  
+  sub_col <- which(header_low == "sub_id")[1]
+  if (is.na(sub_col)) next
+  
+  id_col <- sub_col + 1
+  age_col <- sub_col + 2
+  sex_col <- sub_col + 3
+  
+  condition_col <- sub_col - 1
+  if (condition_col < 1) condition_col <- NA_integer_
+  
+  # SOA headers mark the proportion columns.
+  # the blank column immediately after each SOA header is the corresponding 
+  # RT column.
+  soa_cols <- which(stringr::str_detect(header, "^-?\\d+\\s*ill\\d+"))
+  
+  if (length(soa_cols) == 0) {
+    cat("\nNo SOA columns found for header row", header_i, "\n")
+    next
+  }
+  
+  soa_map <- tibble::tibble(
+    prop_col = soa_cols,
+    rt_col = soa_cols + 1,
+    SOA = extract_soa(header[soa_cols]),
+    soa_header = header[soa_cols]
+  ) %>%
+    dplyr::filter(is.finite(SOA), rt_col <= ncol(raw_mat)) %>%
+    dplyr::arrange(SOA)
+  
+  # Spreadsheet-provided summary columns, if present.
+  # These are only audit columns. They are not used for the analysis.
+  provided_tbw_av_col <- which(stringr::str_detect(header_low, "^tbw\\s*av"))[1]
+  provided_tbw_va_col <- which(stringr::str_detect(header_low, "^tbw\\s*va"))[1]
+  provided_av_rt_col  <- which(stringr::str_detect(header_low, "^av\\s*(bi\\s*)?rt$|^av\\s*rt$"))[1]
+  provided_va_rt_col  <- which(stringr::str_detect(header_low, "^va\\s*(bi\\s*)?rt$|^va\\s*rt$"))[1]
+  
+  cat("\nBlock", h, "| header row:", header_i, "\n")
+  cat("Viewing from header:", viewing_from_header, "\n")
+  cat("Subject column:", sub_col, "\n")
+  cat("ID column:", id_col, "\n")
+  cat("Condition column:", condition_col, "\n")
+  cat("SOAs:", paste(soa_map$SOA, collapse = ", "), "\n")
+  cat("Provided TBW AV col:", provided_tbw_av_col, "\n")
+  cat("Provided TBW VA col:", provided_tbw_va_col, "\n")
+  cat("Provided AV RT col:", provided_av_rt_col, "\n")
+  cat("Provided VA RT col:", provided_va_rt_col, "\n")
+  
+  current_condition <- NA_character_
+  current_viewing <- viewing_from_header
+  
+  block_rows <- list()
+  
+  for (r_i in seq(header_i + 1, next_header - 1)) {
+    
+    row <- clean_chr(unlist(raw_mat[r_i, ]))
+    subj <- row[sub_col]
+    
+    if (is.na(subj)) next
+    if (!stringr::str_detect(stringr::str_to_lower(subj), "^sub[-_]")) next
+    if (stringr::str_to_lower(subj) %in% c("mean", "sd", "se")) next
+    
+    participant_id <- if (id_col <= length(row)) row[id_col] else NA_character_
+    age <- if (age_col <= length(row)) to_num(row[age_col]) else NA_real_
+    sex <- if (sex_col <= length(row)) row[sex_col] else NA_character_
+    
+    condition_raw <- NA_character_
+    if (!is.na(condition_col)) condition_raw <- row[condition_col]
+    
+    detected_viewing <- standardise_viewing(condition_raw)
+    detected_condition <- standardise_condition(condition_raw)
+    
+    if (!is.na(detected_viewing)) current_viewing <- detected_viewing
+    if (!is.na(detected_condition)) current_condition <- detected_condition
+    if (is.na(current_viewing)) current_viewing <- viewing_from_header
+    
+    provided_tbw_av <- if (!is.na(provided_tbw_av_col)) to_num(row[provided_tbw_av_col]) else NA_real_
+    provided_tbw_va <- if (!is.na(provided_tbw_va_col)) to_num(row[provided_tbw_va_col]) else NA_real_
+    provided_av_rt  <- if (!is.na(provided_av_rt_col))  to_num(row[provided_av_rt_col])  else NA_real_
+    provided_va_rt  <- if (!is.na(provided_va_rt_col))  to_num(row[provided_va_rt_col])  else NA_real_
+    
+    tmp <- soa_map %>%
+      dplyr::mutate(
+        row_index = r_i,
+        block = h,
+        sub_id = subj,
+        participant_id = participant_id,
+        age = age,
+        sex = sex,
+        raw_condition_text = condition_raw,
+        condition = current_condition,
+        viewing = current_viewing,
+        prop = purrr::map_dbl(prop_col, ~ to_num(row[.x])),
+        rt = purrr::map_dbl(rt_col, ~ to_num(row[.x])),
+        provided_tbw_AV = provided_tbw_av,
+        provided_tbw_VA = provided_tbw_va,
+        provided_rt_AV = provided_av_rt,
+        provided_rt_VA = provided_va_rt
+      ) %>%
+      dplyr::select(
+        block,
+        row_index,
+        sub_id,
+        participant_id,
+        age,
+        sex,
+        viewing,
+        condition,
+        raw_condition_text,
+        SOA,
+        prop,
+        rt,
+        provided_tbw_AV,
+        provided_tbw_VA,
+        provided_rt_AV,
+        provided_rt_VA
+      )
+    
+    block_rows[[length(block_rows) + 1]] <- tmp
+  }
+  
+  if (length(block_rows) > 0) {
+    all_long[[length(all_long) + 1]] <- dplyr::bind_rows(block_rows)
+  }
+  
+  block_info[[length(block_info) + 1]] <- tibble::tibble(
+    block = h,
+    header_row = header_i,
+    viewing_from_header = viewing_from_header,
+    sub_col = sub_col,
+    id_col = id_col,
+    condition_col = condition_col,
+    n_soa = nrow(soa_map),
+    min_soa = min(soa_map$SOA, na.rm = TRUE),
+    max_soa = max(soa_map$SOA, na.rm = TRUE)
+  )
+}
+
+long_all <- dplyr::bind_rows(all_long)
+
+if (nrow(long_all) == 0) {
+  stop("No subject-level data were parsed. Check Excel layout.")
+}
+
+long_all <- long_all %>%
+  dplyr::mutate(
+    sub_id = stringr::str_replace_all(sub_id, "_", "-"),
+    participant_id = ifelse(is.na(participant_id), "", participant_id),
+    side = dplyr::case_when(
+      SOA < 0 ~ "AV",
+      SOA > 0 ~ "VA",
+      SOA == 0 ~ "Sync",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Manual exclusions happen here.
+if (length(exclude_sub_ids) > 0) {
+  long_all <- long_all %>%
+    dplyr::filter(!sub_id %in% exclude_sub_ids)
+  cat("\nExcluded sub_id values:", paste(exclude_sub_ids, collapse = ", "), "\n")
+}
+
+if (length(exclude_participant_ids) > 0) {
+  long_all <- long_all %>%
+    dplyr::filter(!participant_id %in% exclude_participant_ids)
+  cat("\nExcluded participant_id values:", paste(exclude_participant_ids, collapse = ", "), "\n")
+}
+
+cat("\nParsed long data:\n")
+print(long_all %>% dplyr::count(viewing, condition, side))
+
+cat("\nSubjects parsed:\n")
+print(
+  long_all %>%
+    dplyr::distinct(viewing, condition, sub_id, participant_id) %>%
+    dplyr::arrange(viewing, condition, sub_id),
+  n = Inf
+)
+
+cat("\nBlock info:\n")
+print(dplyr::bind_rows(block_info))
+
+if (save_csv_outputs) {
+  readr::write_csv(long_all, file.path(out_root, "parsed_long_all.csv"))
+  readr::write_csv(dplyr::bind_rows(block_info), file.path(out_root, "block_info.csv"))
+}
+
+# ============================================================
+# analysis runner all other coolness
+# ============================================================
+
+run_one_analysis <- function(analysis_mode) {
+  
+  cat("\n\n============================================================\n")
+  cat("RUNNING ANALYSIS MODE:", analysis_mode, "\n")
+  cat("============================================================\n")
+  
+  out_dir <- file.path(out_root, analysis_mode)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  qc_png_dir <- file.path(out_dir, "individual_QC_png")
+  dir.create(qc_png_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # ------------------------------------------------------------
+  # Select analysis data
+  # ------------------------------------------------------------
+  
+  if (analysis_mode == "ip_vs_ol") {
+    
+    analysis_data <- long_all %>%
+      dplyr::filter(
+        viewing == "Binocular",
+        condition %in% c("IP", "OL")
+      ) %>%
+      dplyr::mutate(
+        group = condition,
+        group_label = dplyr::case_when(
+          condition == "IP" ~ "In-person",
+          condition == "OL" ~ "Online",
+          TRUE ~ condition
+        ),
+        # For IP vs OL, sub_id identifies the paired subject.
+        subject_key = sub_id
+      )
+    
+  } else if (analysis_mode == "bi_vs_mo_online") {
+    
+    analysis_data <- long_all %>%
+      dplyr::filter(
+        (viewing == "Binocular" & condition == "OL") |
+          viewing == "Monocular"
+      ) %>%
+      dplyr::mutate(
+        group = dplyr::case_when(
+          viewing == "Binocular" & condition == "OL" ~ "BI",
+          viewing == "Monocular" ~ "MO",
+          TRUE ~ NA_character_
+        ),
+        group_label = dplyr::case_when(
+          group == "BI" ~ "Binocular online",
+          group == "MO" ~ "Monocular",
+          TRUE ~ group
+        ),
+        # For BI vs MO, sub_id values overlap but are not the same people.
+        # Therefore use a group-specific key.
+        subject_key = paste(group, sub_id, participant_id, sep = "_")
+      ) %>%
+      dplyr::filter(!is.na(group))
+    
+  } else {
+    stop("analysis_mode must be 'ip_vs_ol' or 'bi_vs_mo_online'.")
+  }
+  
+  cat("\nSelected analysis mode:", analysis_mode, "\n")
+  
+  analysis_n <- analysis_data %>%
+    dplyr::distinct(group, group_label, viewing, condition, sub_id, participant_id, subject_key) %>%
+    dplyr::count(group, group_label)
+  
+  print(analysis_n)
+  
+  if (save_csv_outputs) {
+    readr::write_csv(analysis_data, file.path(out_dir, paste0("analysis_data_", analysis_mode, ".csv")))
+    readr::write_csv(analysis_n, file.path(out_dir, paste0("analysis_n_", analysis_mode, ".csv")))
+  }
+  
+  # ------------------------------------------------------------
+  # subject-level sigmoid fits
+  # ------------------------------------------------------------
+  
+  fit_subject_side <- function(df, key) {
+    
+    side_label <- as.character(key$side[[1]])
+    
+    sfit <- fit_sigmoid_side(df, side_label = side_label)
+    
+    tibble::tibble(
+      x0 = sfit$x0,
+      k = sfit$k,
+      rss = sfit$rss,
+      x0_side_ok = sfit$x0_side_ok,
+      k_direction_ok = sfit$k_direction_ok,
+      x0_in_range = sfit$x0_in_range,
+      fit_flag = sfit$fit_flag,
+      tbw_raw = sfit$tbw_raw,
+      pred_grid = list(sfit$pred_grid)
+    )
+  }
+  
+  subject_fits <- analysis_data %>%
+    dplyr::filter(side %in% c("AV", "VA")) %>%
+    dplyr::group_by(subject_key, sub_id, participant_id, group, group_label, side) %>%
+    dplyr::group_modify(~ fit_subject_side(.x, .y)) %>%
+    dplyr::ungroup()
+  
+  subject_pred_grid <- subject_fits %>%
+    dplyr::select(subject_key, sub_id, participant_id, group, group_label, side, fit_flag, pred_grid) %>%
+    tidyr::unnest(cols = c(pred_grid))
+  
+  subject_summary <- subject_fits %>%
+    dplyr::select(
+      subject_key,
+      sub_id,
+      participant_id,
+      group,
+      group_label,
+      side,
+      x0,
+      k,
+      rss,
+      x0_side_ok,
+      k_direction_ok,
+      x0_in_range,
+      fit_flag,
+      tbw_raw
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = side,
+      values_from = c(
+        x0,
+        k,
+        rss,
+        x0_side_ok,
+        k_direction_ok,
+        x0_in_range,
+        fit_flag,
+        tbw_raw
+      ),
+      names_sep = "_"
+    ) %>%
+    dplyr::mutate(
+      full_tbw_raw = dplyr::case_when(
+        is.finite(tbw_raw_AV) & is.finite(tbw_raw_VA) ~ tbw_raw_AV + tbw_raw_VA,
+        TRUE ~ NA_real_
+      ),
+      any_flagged = dplyr::case_when(
+        fit_flag_AV != "ok" | fit_flag_VA != "ok" ~ TRUE,
+        TRUE ~ FALSE
+      )
+    )
+  
+  cat("\n================ SUBJECT-LEVEL RAW TBW ESTIMATES ================\n")
+  print(subject_summary, n = Inf)
+  
+  fit_flag_counts <- subject_fits %>%
+    dplyr::count(group, group_label, side, fit_flag)
+  
+  cat("\n================ FIT FLAG COUNTS ================\n")
+  print(fit_flag_counts)
+  
+  nice_tbl(subject_summary, caption = paste0("Subject-level raw TBW estimates: ", analysis_mode))
+  nice_tbl(fit_flag_counts, caption = paste0("Fit flag counts: ", analysis_mode))
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      subject_fits %>% dplyr::select(-pred_grid),
+      file.path(out_dir, paste0("subject_fit_flags_long_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      subject_summary,
+      file.path(out_dir, paste0("subject_summary_raw_flagged_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      fit_flag_counts,
+      file.path(out_dir, paste0("fit_flag_counts_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # gaussian fits for individual QC only
+  # ------------------------------------------------------------
+  
+  fit_subject_gaussian <- function(df, key) {
+    
+    gfit <- fit_gaussian_full(df)
+    
+    tibble::tibble(
+      gauss_fwhm = gfit$fwhm,
+      gauss_a = gfit$a,
+      gauss_b = gfit$b,
+      gauss_c = gfit$c,
+      gauss_rss = gfit$rss,
+      gauss_fit_flag = gfit$fit_flag,
+      gauss_grid = list(gfit$pred_grid)
+    )
+  }
+  
+  subject_gauss <- analysis_data %>%
+    dplyr::filter(is.finite(SOA)) %>%
+    dplyr::group_by(subject_key, sub_id, participant_id, group, group_label) %>%
+    dplyr::group_modify(~ fit_subject_gaussian(.x, .y)) %>%
+    dplyr::ungroup()
+  
+  subject_gauss_grid <- subject_gauss %>%
+    dplyr::select(subject_key, sub_id, participant_id, group, group_label, gauss_grid) %>%
+    tidyr::unnest(cols = c(gauss_grid))
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      subject_gauss %>% dplyr::select(-gauss_grid),
+      file.path(out_dir, paste0("subject_gaussian_QC_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # audit against spreadsheet-provided TBW/RT values
+  # ------------------------------------------------------------
+  
+  provided_metrics <- analysis_data %>%
+    dplyr::distinct(
+      subject_key,
+      sub_id,
+      participant_id,
+      group,
+      group_label,
+      provided_tbw_AV,
+      provided_tbw_VA,
+      provided_rt_AV,
+      provided_rt_VA
+    )
+  
+  tbw_compare <- subject_summary %>%
+    dplyr::left_join(
+      provided_metrics,
+      by = c("subject_key", "sub_id", "participant_id", "group", "group_label")
+    ) %>%
+    dplyr::mutate(
+      diff_raw_AV_vs_sheet = tbw_raw_AV - provided_tbw_AV,
+      diff_raw_VA_vs_sheet = tbw_raw_VA - provided_tbw_VA
+    ) %>%
+    dplyr::select(
+      subject_key,
+      sub_id,
+      participant_id,
+      group,
+      group_label,
+      tbw_raw_AV,
+      provided_tbw_AV,
+      diff_raw_AV_vs_sheet,
+      fit_flag_AV,
+      tbw_raw_VA,
+      provided_tbw_VA,
+      diff_raw_VA_vs_sheet,
+      fit_flag_VA,
+      full_tbw_raw,
+      any_flagged
+    )
+  
+  cat("\n================ TBW AUDIT AGAINST SPREADSHEET COLUMNS ================\n")
+  print(tbw_compare, n = Inf)
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      tbw_compare,
+      file.path(out_dir, paste0("TBW_audit_against_spreadsheet_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # individual subject QC plots
+  # full gaussian red overlay + separate AV/VA sigmoid blue overlays
+  # ------------------------------------------------------------
+  
+  plot_one_subject <- function(one_subject_key) {
+    
+    obs <- analysis_data %>%
+      dplyr::filter(subject_key == one_subject_key, is.finite(SOA))
+    
+    curves_sig <- subject_pred_grid %>%
+      dplyr::filter(subject_key == one_subject_key)
+    
+    curves_gauss <- subject_gauss_grid %>%
+      dplyr::filter(subject_key == one_subject_key)
+    
+    labels <- subject_summary %>%
+      dplyr::filter(subject_key == one_subject_key) %>%
+      dplyr::left_join(
+        subject_gauss %>%
+          dplyr::select(subject_key, group, gauss_fwhm, gauss_fit_flag),
+        by = c("subject_key", "group")
+      ) %>%
+      dplyr::mutate(
+        x_label = min(obs$SOA, na.rm = TRUE),
+        y_label = 1.12,
+        label = paste0(
+          "sub_id: ", sub_id,
+          "\nID: ", participant_id,
+          "\nAV TBW: ", round(tbw_raw_AV, 1), " ms [", fit_flag_AV, "]",
+          "\nVA TBW: ", round(tbw_raw_VA, 1), " ms [", fit_flag_VA, "]",
+          "\nFull raw TBW: ", round(full_tbw_raw, 1), " ms",
+          "\nGaussian FWHM QC: ", round(gauss_fwhm, 1), " ms [", gauss_fit_flag, "]"
+        )
+      )
+    
+    ggplot2::ggplot(obs, ggplot2::aes(x = SOA, y = prop)) +
+      ggplot2::geom_point(size = 2.2, alpha = 0.90, colour = "black") +
+      ggplot2::geom_line(
+        data = curves_sig,
+        ggplot2::aes(x = SOA, y = sig_fit, group = interaction(group, side)),
+        linewidth = 1.1,
+        colour = "blue",
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_line(
+        data = curves_gauss,
+        ggplot2::aes(x = SOA, y = gauss_fit, group = group),
+        linewidth = 1.1,
+        colour = "red",
+        alpha = 0.90,
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_vline(xintercept = 0, linewidth = 0.5, colour = "grey30") +
+      ggplot2::geom_vline(
+        data = labels,
+        ggplot2::aes(xintercept = x0_AV),
+        linetype = "dashed",
+        linewidth = 0.6,
+        colour = "blue",
+        alpha = 0.70,
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_vline(
+        data = labels,
+        ggplot2::aes(xintercept = x0_VA),
+        linetype = "dashed",
+        linewidth = 0.6,
+        colour = "blue",
+        alpha = 0.70,
+        na.rm = TRUE
+      ) +
+      ggplot2::geom_text(
+        data = labels,
+        ggplot2::aes(x = x_label, y = y_label, label = label),
+        inherit.aes = FALSE,
+        hjust = 0,
+        vjust = 1,
+        size = 3.0,
+        lineheight = 1.02
+      ) +
+      ggplot2::facet_wrap(~ group_label, ncol = 1) +
+      ggplot2::scale_x_continuous(
+        breaks = c(-300, -250, -200, -150, -100, -50, 0, 50, 100, 150, 200, 250, 300),
+        limits = c(-320, 320)
+      ) +
+      ggplot2::scale_y_continuous(
+        limits = c(0, 1.18),
+        breaks = seq(0, 1, 0.25)
+      ) +
+      ggplot2::labs(
+        title = paste0("Individual QC: ", one_subject_key),
+        subtitle = "Blue = separate AV/VA sigmoid fits; red = full Gaussian QC overlay",
+        x = "SOA (ms)",
+        y = "Proportion perceived simultaneous"
+      ) +
+      ggplot2::theme_classic(base_size = 12) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 16),
+        plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 10),
+        strip.text = ggplot2::element_text(face = "bold", size = 12),
+        panel.spacing = grid::unit(18, "pt"),
+        plot.margin = grid::unit(c(12, 18, 12, 18), "pt")
+      )
+  }
+  
+  all_subject_keys <- sort(unique(analysis_data$subject_key))
+  qc_pdf <- file.path(out_dir, paste0("QC_individual_sigmoid_gaussian_", analysis_mode, ".pdf"))
+  
+  if (save_plots) {
+    
+    grDevices::pdf(qc_pdf, width = 11, height = 8.5)
+    
+    for (sid in all_subject_keys) {
+      print(plot_one_subject(sid))
+    }
+    
+    grDevices::dev.off()
+    
+    cat("\nSaved multi-page individual-subject QC PDF:\n", qc_pdf, "\n")
+    
+    for (sid in all_subject_keys) {
+      
+      p_sid <- plot_one_subject(sid)
+      
+      safe_sid <- stringr::str_replace_all(sid, "[^A-Za-z0-9_-]", "_")
+      
+      ggplot2::ggsave(
+        filename = file.path(qc_png_dir, paste0("QC_", safe_sid, "_", analysis_mode, ".png")),
+        plot = p_sid,
+        width = 11,
+        height = 8.5,
+        dpi = 300,
+        bg = "white"
+      )
+    }
+    
+    cat("\nSaved one PNG per subject here:\n", qc_png_dir, "\n")
+  }
+  
+  if (show_all_subject_plots_in_rstudio) {
+    for (sid in all_subject_keys) {
+      print(plot_one_subject(sid))
+    }
+  }
+  
+  # ------------------------------------------------------------
+  # Subject-level raw TBW descriptives
+  # ------------------------------------------------------------
+  
+  subject_desc_raw <- subject_summary %>%
+    dplyr::group_by(group, group_label) %>%
+    dplyr::summarise(
+      n_subjects = dplyr::n(),
+      
+      n_AV = sum(is.finite(tbw_raw_AV)),
+      n_flagged_AV = sum(fit_flag_AV != "ok", na.rm = TRUE),
+      mean_AV_TBW = mean(tbw_raw_AV, na.rm = TRUE),
+      sd_AV_TBW = sd(tbw_raw_AV, na.rm = TRUE),
+      se_AV_TBW = sd_AV_TBW / sqrt(n_AV),
+      
+      n_VA = sum(is.finite(tbw_raw_VA)),
+      n_flagged_VA = sum(fit_flag_VA != "ok", na.rm = TRUE),
+      mean_VA_TBW = mean(tbw_raw_VA, na.rm = TRUE),
+      sd_VA_TBW = sd(tbw_raw_VA, na.rm = TRUE),
+      se_VA_TBW = sd_VA_TBW / sqrt(n_VA),
+      
+      n_full = sum(is.finite(full_tbw_raw)),
+      n_flagged_full = sum(any_flagged %in% TRUE, na.rm = TRUE),
+      mean_full_TBW = mean(full_tbw_raw, na.rm = TRUE),
+      sd_full_TBW = sd(full_tbw_raw, na.rm = TRUE),
+      se_full_TBW = sd_full_TBW / sqrt(n_full),
+      
+      .groups = "drop"
+    )
+  
+  cat("\n================ SUBJECT-LEVEL RAW TBW DESCRIPTIVES ================\n")
+  print(subject_desc_raw)
+  nice_tbl(subject_desc_raw, caption = paste0("Subject-level raw TBW descriptives: ", analysis_mode))
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      subject_desc_raw,
+      file.path(out_dir, paste0("subject_TBW_descriptives_raw_flagged_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # Group-level sigmoid fits on group mean proportions
+  # ------------------------------------------------------------
+  
+  group_means <- analysis_data %>%
+    dplyr::filter(side %in% c("AV", "VA")) %>%
+    dplyr::group_by(group, group_label, side, SOA) %>%
+    dplyr::summarise(
+      mean_prop = mean(prop, na.rm = TRUE),
+      sd_prop = sd(prop, na.rm = TRUE),
+      n = sum(is.finite(prop)),
+      se_prop = sd_prop / sqrt(n),
+      .groups = "drop"
+    )
+  
+  fit_group_side <- function(df, key) {
+    
+    side_label <- as.character(key$side[[1]])
+    
+    df_fit <- df %>%
+      dplyr::rename(prop = mean_prop)
+    
+    sfit <- fit_sigmoid_side(df_fit, side_label = side_label)
+    
+    tibble::tibble(
+      group_x0 = sfit$x0,
+      group_k = sfit$k,
+      group_rss = sfit$rss,
+      group_x0_side_ok = sfit$x0_side_ok,
+      group_k_direction_ok = sfit$k_direction_ok,
+      group_x0_in_range = sfit$x0_in_range,
+      group_fit_flag = sfit$fit_flag,
+      group_tbw = sfit$tbw_raw,
+      pred_grid = list(sfit$pred_grid)
+    )
+  }
+  
+  group_fits <- group_means %>%
+    dplyr::group_by(group, group_label, side) %>%
+    dplyr::group_modify(~ fit_group_side(.x, .y)) %>%
+    dplyr::ungroup()
+  
+  group_pred_grid <- group_fits %>%
+    dplyr::select(group, group_label, side, pred_grid) %>%
+    tidyr::unnest(cols = c(pred_grid))
+  
+  cat("\n================ GROUP-LEVEL SIGMOID ESTIMATES ================\n")
+  print(
+    group_fits %>%
+      dplyr::select(
+        group,
+        group_label,
+        side,
+        group_x0,
+        group_k,
+        group_fit_flag,
+        group_tbw
+      )
+  )
+  
+  nice_tbl(
+    group_fits %>%
+      dplyr::select(
+        group,
+        group_label,
+        side,
+        group_x0,
+        group_k,
+        group_fit_flag,
+        group_tbw
+      ),
+    caption = paste0("Group-level sigmoid estimates: ", analysis_mode)
+  )
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      group_means,
+      file.path(out_dir, paste0("group_means_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      group_fits %>%
+        dplyr::select(
+          group,
+          group_label,
+          side,
+          group_x0,
+          group_k,
+          group_rss,
+          group_x0_side_ok,
+          group_k_direction_ok,
+          group_x0_in_range,
+          group_fit_flag,
+          group_tbw
+        ),
+      file.path(out_dir, paste0("group_sigmoid_estimates_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # group plot
+  # ------------------------------------------------------------
+  
+  p_group_sigmoid <- ggplot2::ggplot(
+    group_means,
+    ggplot2::aes(x = SOA, y = mean_prop, colour = group)
+  ) +
+    ggplot2::geom_point(size = 2.5) +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = mean_prop - se_prop, ymax = mean_prop + se_prop),
+      width = 8,
+      linewidth = 0.75
+    ) +
+    ggplot2::geom_line(
+      data = group_pred_grid,
+      ggplot2::aes(
+        x = SOA,
+        y = sig_fit,
+        colour = group,
+        group = interaction(group, side)
+      ),
+      linewidth = 1.35,
+      na.rm = TRUE
+    ) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.6, colour = "black") +
+    ggplot2::annotate(
+      "text",
+      x = -250,
+      y = 0.08,
+      label = "AV / left side",
+      fontface = "bold",
+      size = 5
+    ) +
+    ggplot2::annotate(
+      "text",
+      x = 250,
+      y = 0.08,
+      label = "VA / right side",
+      fontface = "bold",
+      size = 5
+    ) +
+    ggplot2::scale_colour_manual(values = group_colours) +
+    ggplot2::scale_x_continuous(
+      breaks = c(-300, -250, -200, -150, -100, -50, 0, 50, 100, 150, 200, 250, 300),
+      limits = c(-320, 320)
+    ) +
+    ggplot2::coord_cartesian(ylim = c(0, 1.05)) +
+    ggplot2::labs(
+      title = "Group Mean TBW with Separate Sigmoid Fits",
+      subtitle = paste0(analysis_mode, " | raw fits retained and flagged"),
+      x = "SOA (ms)",
+      y = "Mean proportion perceived simultaneous",
+      colour = "Group"
+    ) +
+    ggplot2::theme_minimal(base_size = 15) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 22),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 12),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "right"
+    )
+  
+  print(p_group_sigmoid)
+  
+  if (save_plots) {
+    ggplot2::ggsave(
+      filename = file.path(out_dir, paste0("group_sigmoid_MoroSteeves_style_", analysis_mode, ".png")),
+      plot = p_group_sigmoid,
+      width = 12,
+      height = 7,
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # subject-level TBW bar plot, raw values included and flags shown
+  # ------------------------------------------------------------
+  
+  tbw_subject_long <- subject_summary %>%
+    dplyr::select(
+      subject_key,
+      sub_id,
+      participant_id,
+      group,
+      group_label,
+      tbw_raw_AV,
+      tbw_raw_VA,
+      fit_flag_AV,
+      fit_flag_VA
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(tbw_raw_AV, tbw_raw_VA),
+      names_to = "side",
+      values_to = "tbw"
+    ) %>%
+    dplyr::mutate(
+      side = dplyr::case_when(
+        side == "tbw_raw_AV" ~ "AV",
+        side == "tbw_raw_VA" ~ "VA",
+        TRUE ~ side
+      ),
+      fit_flag = dplyr::case_when(
+        side == "AV" ~ fit_flag_AV,
+        side == "VA" ~ fit_flag_VA,
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::filter(is.finite(tbw))
+  
+  tbw_bar <- tbw_subject_long %>%
+    dplyr::group_by(group, group_label, side) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_flagged = sum(fit_flag != "ok", na.rm = TRUE),
+      mean_tbw = mean(tbw, na.rm = TRUE),
+      sd_tbw = sd(tbw, na.rm = TRUE),
+      se_tbw = sd_tbw / sqrt(n),
+      .groups = "drop"
+    )
+  
+  p_tbw_bar <- ggplot2::ggplot(
+    tbw_bar,
+    ggplot2::aes(x = side, y = mean_tbw, fill = group)
+  ) +
+    ggplot2::geom_col(
+      position = ggplot2::position_dodge(width = 0.75),
+      width = 0.62,
+      colour = "black",
+      alpha = 0.70
+    ) +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = mean_tbw - se_tbw, ymax = mean_tbw + se_tbw),
+      position = ggplot2::position_dodge(width = 0.75),
+      width = 0.18,
+      linewidth = 0.8
+    ) +
+    ggplot2::geom_text(
+      ggplot2::aes(label = paste0("n=", n, "\nflag=", n_flagged)),
+      position = ggplot2::position_dodge(width = 0.75),
+      vjust = -0.35,
+      size = 4
+    ) +
+    ggplot2::scale_fill_manual(values = group_colours) +
+    ggplot2::labs(
+      title = "Subject-level Raw TBW Estimates",
+      subtitle = "All finite raw sigmoid-derived TBWs included; flagged fits retained",
+      x = "TBW side",
+      y = "TBW (ms)",
+      fill = "Group"
+    ) +
+    ggplot2::theme_classic(base_size = 16) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 22),
+      plot.subtitle = ggplot2::element_text(hjust = 0.5, size = 12)
+    )
+  
+  print(p_tbw_bar)
+  
+  if (save_plots) {
+    ggplot2::ggsave(
+      filename = file.path(out_dir, paste0("subject_TBW_bar_raw_flagged_", analysis_mode, ".png")),
+      plot = p_tbw_bar,
+      width = 8,
+      height = 6,
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      tbw_subject_long,
+      file.path(out_dir, paste0("subject_TBW_long_raw_flagged_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      tbw_bar,
+      file.path(out_dir, paste0("subject_TBW_bar_values_", analysis_mode, ".csv"))
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # RT subject summary and audit
+  # ------------------------------------------------------------
+  
+  rt_subject_summary <- analysis_data %>%
+    dplyr::filter(side %in% c("AV", "VA")) %>%
+    dplyr::group_by(subject_key, sub_id, participant_id, group, group_label, side) %>%
+    dplyr::summarise(
+      subject_mean_rt = mean(rt, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      subject_mean_rt = ifelse(is.nan(subject_mean_rt), NA_real_, subject_mean_rt)
+    )
+  
+  cat("\n================ SUBJECT-LEVEL RT SUMMARY ================\n")
+  print(rt_subject_summary, n = Inf)
+  
+  rt_compare <- rt_subject_summary %>%
+    dplyr::left_join(
+      provided_metrics,
+      by = c("subject_key", "sub_id", "participant_id", "group", "group_label")
+    ) %>%
+    dplyr::mutate(
+      provided_rt = dplyr::case_when(
+        side == "AV" ~ provided_rt_AV,
+        side == "VA" ~ provided_rt_VA,
+        TRUE ~ NA_real_
+      ),
+      diff_rt_vs_sheet = subject_mean_rt - provided_rt
+    ) %>%
+    dplyr::select(
+      subject_key,
+      sub_id,
+      participant_id,
+      group,
+      group_label,
+      side,
+      subject_mean_rt,
+      provided_rt,
+      diff_rt_vs_sheet
+    )
+  
+  cat("\n================ RT AUDIT AGAINST SPREADSHEET COLUMNS ================\n")
+  print(rt_compare, n = Inf)
+  
+  rt_desc <- rt_subject_summary %>%
+    dplyr::group_by(group, group_label, side) %>%
+    dplyr::summarise(
+      n = sum(is.finite(subject_mean_rt)),
+      mean_rt = mean(subject_mean_rt, na.rm = TRUE),
+      sd_rt = sd(subject_mean_rt, na.rm = TRUE),
+      se_rt = sd_rt / sqrt(n),
+      .groups = "drop"
+    )
+  
+  cat("\n================ RT DESCRIPTIVES ================\n")
+  print(rt_desc)
+  nice_tbl(rt_desc, caption = paste0("RT descriptives: ", analysis_mode))
+  
+  if (save_csv_outputs) {
+    readr::write_csv(
+      rt_subject_summary,
+      file.path(out_dir, paste0("rt_subject_summary_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      rt_compare,
+      file.path(out_dir, paste0("RT_audit_against_spreadsheet_", analysis_mode, ".csv"))
+    )
+    
+    readr::write_csv(
+      rt_desc,
+      file.path(out_dir, paste0("rt_descriptives_", analysis_mode, ".csv"))
+    )
+  }
+  
+  p_rt <- ggplot2::ggplot(
+    rt_desc,
+    ggplot2::aes(x = side, y = mean_rt, fill = group)
+  ) +
+    ggplot2::geom_col(
+      position = ggplot2::position_dodge(width = 0.75),
+      width = 0.62,
+      colour = "black",
+      alpha = 0.65
+    ) +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = mean_rt - se_rt, ymax = mean_rt + se_rt),
+      position = ggplot2::position_dodge(width = 0.75),
+      width = 0.18,
+      linewidth = 0.8,
+      na.rm = TRUE
+    ) +
+    ggplot2::scale_fill_manual(values = group_colours) +
+    ggplot2::labs(
+      title = "Group Mean Response Time",
+      x = "TBW side",
+      y = "RT (s)",
+      fill = "Group"
+    ) +
+    ggplot2::theme_classic(base_size = 16) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0.5, size = 22),
+      axis.title = ggplot2::element_text(size = 16),
+      axis.text = ggplot2::element_text(size = 14)
+    )
+  
+  print(p_rt)
+  
+  if (save_plots) {
+    ggplot2::ggsave(
+      filename = file.path(out_dir, paste0("group_rt_", analysis_mode, ".png")),
+      plot = p_rt,
+      width = 8,
+      height = 6,
+      dpi = 300,
+      bg = "white"
+    )
+  }
+  
+  # ------------------------------------------------------------
+  # Statistical tests
+  # ------------------------------------------------------------
+  
+  paired_ip_ol_test <- function(df, value_col, label) {
+    
+    value_col <- rlang::enquo(value_col)
+    
+    wide <- df %>%
+      dplyr::filter(group %in% c("IP", "OL")) %>%
+      dplyr::select(sub_id, group, value = !!value_col) %>%
+      tidyr::pivot_wider(names_from = group, values_from = value) %>%
+      dplyr::filter(is.finite(IP), is.finite(OL))
+    
+    cat("\n\n============================================================\n")
+    cat(label, "\n")
+    cat("Paired n:", nrow(wide), "\n")
+    cat("Raw finite values retained. Check flags separately.\n")
+    cat("============================================================\n")
+    
+    if (nrow(wide) < 2) {
+      cat("Not enough paired data.\n")
+      return(NULL)
+    }
+    
+    diff_vals <- wide$IP - wide$OL
+    
+    desc <- tibble::tibble(
+      n = nrow(wide),
+      mean_IP = mean(wide$IP),
+      sd_IP = sd(wide$IP),
+      mean_OL = mean(wide$OL),
+      sd_OL = sd(wide$OL),
+      mean_difference_IP_minus_OL = mean(diff_vals),
+      sd_difference = sd(diff_vals)
+    )
+    
+    print(desc)
+    
+    sh_tbl <- NULL
+    
+    if (nrow(wide) >= 3) {
+      sh <- shapiro.test(diff_vals)
+      
+      sh_tbl <- tibble::tibble(
+        W = unname(sh$statistic),
+        p_value = unname(sh$p.value)
+      )
+      
+      cat("\nShapiro-Wilk on paired differences:\n")
+      print(sh_tbl)
+    }
+    
+    t_res <- t.test(wide$IP, wide$OL, paired = TRUE)
+    
+    t_tbl <- tibble::tibble(
+      test = "paired t-test",
+      t = unname(t_res$statistic),
+      df = unname(t_res$parameter),
+      p_value = unname(t_res$p.value),
+      conf_low = t_res$conf.int[1],
+      conf_high = t_res$conf.int[2]
+    )
+    
+    cat("\nPaired t-test:\n")
+    print(t_tbl)
+    
+    w_res <- wilcox.test(
+      wide$IP,
+      wide$OL,
+      paired = TRUE,
+      exact = FALSE,
+      correct = TRUE
+    )
+    
+    w_tbl <- tibble::tibble(
+      test = "Wilcoxon signed-rank",
+      W = unname(w_res$statistic),
+      p_value = unname(w_res$p.value)
+    )
+    
+    cat("\nWilcoxon signed-rank:\n")
+    print(w_tbl)
+    
+    d_tbl <- effectsize::cohens_d(
+      wide$IP,
+      wide$OL,
+      paired = TRUE,
+      hedges_correction = TRUE,
+      ci = 0.95
+    )
+    
+    cat("\nPaired-samples Cohen's d:\n")
+    print(d_tbl)
+    
+    tibble::tibble(
+      label = label,
+      paired_n = nrow(wide),
+      mean_IP = desc$mean_IP,
+      sd_IP = desc$sd_IP,
+      mean_OL = desc$mean_OL,
+      sd_OL = desc$sd_OL,
+      mean_difference_IP_minus_OL = desc$mean_difference_IP_minus_OL,
+      shapiro_W = ifelse(is.null(sh_tbl), NA_real_, sh_tbl$W),
+      shapiro_p = ifelse(is.null(sh_tbl), NA_real_, sh_tbl$p_value),
+      t = t_tbl$t,
+      df = t_tbl$df,
+      t_p = t_tbl$p_value,
+      t_conf_low = t_tbl$conf_low,
+      t_conf_high = t_tbl$conf_high,
+      wilcox_W = w_tbl$W,
+      wilcox_p = w_tbl$p_value
+    )
+  }
+  
+  independent_group_test <- function(df, value_col, label) {
+    
+    value_col <- rlang::enquo(value_col)
+    
+    d <- df %>%
+      dplyr::filter(group %in% c("BI", "MO")) %>%
+      dplyr::select(subject_key, group, value = !!value_col) %>%
+      dplyr::filter(is.finite(value))
+    
+    cat("\n\n============================================================\n")
+    cat(label, "\n")
+    cat("Group counts:\n")
+    print(table(d$group))
+    cat("Raw finite values retained. Check flags separately.\n")
+    cat("============================================================\n")
+    
+    if (length(unique(d$group)) < 2) {
+      cat("Not enough groups.\n")
+      return(NULL)
+    }
+    
+    desc <- d %>%
+      dplyr::group_by(group) %>%
+      dplyr::summarise(
+        n = dplyr::n(),
+        mean = mean(value),
+        sd = sd(value),
+        se = sd / sqrt(n),
+        .groups = "drop"
+      )
+    
+    print(desc)
+    
+    t_res <- t.test(value ~ group, data = d, var.equal = FALSE)
+    
+    t_tbl <- tibble::tibble(
+      test = "Welch independent t-test",
+      t = unname(t_res$statistic),
+      df = unname(t_res$parameter),
+      p_value = unname(t_res$p.value),
+      conf_low = t_res$conf.int[1],
+      conf_high = t_res$conf.int[2]
+    )
+    
+    cat("\nWelch independent t-test:\n")
+    print(t_tbl)
+    
+    w_res <- wilcox.test(value ~ group, data = d, exact = FALSE, correct = TRUE)
+    
+    w_tbl <- tibble::tibble(
+      test = "Wilcoxon rank-sum",
+      W = unname(w_res$statistic),
+      p_value = unname(w_res$p.value)
+    )
+    
+    cat("\nWilcoxon rank-sum:\n")
+    print(w_tbl)
+    
+    d_eff <- effectsize::cohens_d(
+      value ~ group,
+      data = d,
+      pooled_sd = FALSE,
+      ci = 0.95
+    )
+    
+    cat("\nCohen's d:\n")
+    print(d_eff)
+    
+    tibble::tibble(
+      label = label,
+      n_BI = desc$n[desc$group == "BI"],
+      mean_BI = desc$mean[desc$group == "BI"],
+      sd_BI = desc$sd[desc$group == "BI"],
+      n_MO = desc$n[desc$group == "MO"],
+      mean_MO = desc$mean[desc$group == "MO"],
+      sd_MO = desc$sd[desc$group == "MO"],
+      t = t_tbl$t,
+      df = t_tbl$df,
+      t_p = t_tbl$p_value,
+      t_conf_low = t_tbl$conf_low,
+      t_conf_high = t_tbl$conf_high,
+      wilcox_W = w_tbl$W,
+      wilcox_p = w_tbl$p_value
+    )
+  }
+  
+  stats_tables <- list()
+  
+  if (analysis_mode == "ip_vs_ol") {
+    
+    stats_tables$tbw_av <- paired_ip_ol_test(
+      subject_summary,
+      tbw_raw_AV,
+      "AV TBW raw: In-person vs Online"
+    )
+    
+    stats_tables$tbw_va <- paired_ip_ol_test(
+      subject_summary,
+      tbw_raw_VA,
+      "VA TBW raw: In-person vs Online"
+    )
+    
+    stats_tables$tbw_full <- paired_ip_ol_test(
+      subject_summary,
+      full_tbw_raw,
+      "Full TBW raw: In-person vs Online"
+    )
+    
+    stats_tables$rt_av <- paired_ip_ol_test(
+      rt_subject_summary %>% dplyr::filter(side == "AV"),
+      subject_mean_rt,
+      "AV RT: In-person vs Online"
+    )
+    
+    stats_tables$rt_va <- paired_ip_ol_test(
+      rt_subject_summary %>% dplyr::filter(side == "VA"),
+      subject_mean_rt,
+      "VA RT: In-person vs Online"
+    )
+  }
+  
+  if (analysis_mode == "bi_vs_mo_online") {
+    
+    stats_tables$tbw_av <- independent_group_test(
+      subject_summary,
+      tbw_raw_AV,
+      "AV TBW raw: Binocular Online vs Monocular"
+    )
+    
+    stats_tables$tbw_va <- independent_group_test(
+      subject_summary,
+      tbw_raw_VA,
+      "VA TBW raw: Binocular Online vs Monocular"
+    )
+    
+    stats_tables$tbw_full <- independent_group_test(
+      subject_summary,
+      full_tbw_raw,
+      "Full TBW raw: Binocular Online vs Monocular"
+    )
+    
+    stats_tables$rt_av <- independent_group_test(
+      rt_subject_summary %>% dplyr::filter(side == "AV"),
+      subject_mean_rt,
+      "AV RT: Binocular Online vs Monocular"
+    )
+    
+    stats_tables$rt_va <- independent_group_test(
+      rt_subject_summary %>% dplyr::filter(side == "VA"),
+      subject_mean_rt,
+      "VA RT: Binocular Online vs Monocular"
+    )
+  }
+  
+  stats_out <- dplyr::bind_rows(stats_tables)
+  
+  if (save_csv_outputs && nrow(stats_out) > 0) {
+    readr::write_csv(
+      stats_out,
+      file.path(out_dir, paste0("stats_summary_", analysis_mode, ".csv"))
+    )
+  }
+  
+  cat("\n\nDone with analysis mode:", analysis_mode, "\n")
+  cat("Output folder:", out_dir, "\n")
+  cat("Individual QC PDF:", qc_pdf, "\n")
+  cat("Individual QC PNG folder:", qc_png_dir, "\n")
+  
+  invisible(
+    list(
+      analysis_data = analysis_data,
+      subject_summary = subject_summary,
+      subject_fits = subject_fits,
+      subject_gauss = subject_gauss,
+      group_means = group_means,
+      group_fits = group_fits,
+      rt_subject_summary = rt_subject_summary,
+      stats = stats_out
+    )
+  )
+}
+
+# ============================================================
+# run all the bloody analyses i specified
+# ============================================================
+
+results <- list()
+
+for (mode in analysis_modes) {
+  results[[mode]] <- run_one_analysis(mode)
+}
+
+cat("\n\n============================================================\n")
+cat("ALL ANALYSES COMPLETE.\n")
+cat("Root output folder:", out_root, "\n")
+cat("Main behaviour:\n")
+cat("- Separate AV and VA sigmoid fits are used for TBW.\n")
+cat("- Full Gaussian is retained only as an individual QC overlay.\n")
+cat("- No capping.\n")
+cat("- No automatic removal of flagged fits.\n")
+cat("- Raw fitted TBWs are retained if finite.\n")
+cat("- Fits outside tested SOA range are flagged.\n")
+cat("- Manual exclusions can be set at the top of the script.\n")
+cat("- Both in-person vs online and binocular-online vs monocular analyses can be run.\n")
+cat("============================================================\n")
